@@ -1,117 +1,79 @@
-from __future__ import absolute_import
-from __future__ import print_function
-
 import os
-import multiprocessing as mp
-from subprocess import call
-import warnings
+import torch
+import torchvision
+import torchvision.transforms as transforms
 import numpy as np
-import scipy.io as sio
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from sklearn.metrics import roc_curve, auc, roc_auc_score
-from sklearn.linear_model import LogisticRegressionCV
-from sklearn.preprocessing import scale
-import keras.backend as K
-from keras.datasets import mnist, cifar10
-from keras.utils import np_utils
-from keras.models import Sequential
-from keras.layers import Dense, Dropout, Activation, Flatten, BatchNormalization
-from keras.layers import Conv2D, MaxPooling2D
-from keras.regularizers import l2
-import tensorflow as tf
-from scipy.spatial.distance import pdist, cdist, squareform
-from keras import regularizers
-from sklearn.decomposition import PCA
+from torchvision.datasets import MNIST, CIFAR10
+from scipy.io import loadmat
+from torch.utils.data import DataLoader, Subset
 
-# Gaussian noise scale sizes that were determined so that the average
-# L-2 perturbation size is equal to that of the adversarial samples
-# mnist roughly L2_difference/20
-# cifar roughly L2_difference/54
-# svhn roughly L2_difference/60
-# be very carefully with these settings, tune to have noisy/adv have the same L2-norm
-# otherwise artifact will lose its accuracy
-# STDEVS = {
-#     'mnist': {'fgsm': 0.264, 'bim-a': 0.111, 'bim-b': 0.184, 'cw-l2': 0.588},
-#     'cifar': {'fgsm': 0.0504, 'bim-a': 0.0087, 'bim-b': 0.0439, 'cw-l2': 0.015},
-#     'svhn': {'fgsm': 0.1332, 'bim-a': 0.015, 'bim-b': 0.1024, 'cw-l2': 0.0379}
-# }
-
-# fined tuned again when retrained all models with X in [-0.5, 0.5]
+# Constants
 STDEVS = {
     'mnist': {'fgsm': 0.271, 'bim-a': 0.111, 'bim-b': 0.167, 'cw-l2': 0.207},
     'cifar': {'fgsm': 0.0504, 'bim-a': 0.0084, 'bim-b': 0.0428, 'cw-l2': 0.007},
     'svhn': {'fgsm': 0.133, 'bim-a': 0.0155, 'bim-b': 0.095, 'cw-l2': 0.008}
 }
-
-# CLIP_MIN = 0.0
-# CLIP_MAX = 1.0
 CLIP_MIN = -0.5
 CLIP_MAX = 0.5
-PATH_DATA = "data/"
+DATA_PATH = "data/"
 
 # Set random seed
 np.random.seed(0)
-
+torch.manual_seed(0)
 
 def get_data(dataset='mnist'):
     """
-    images in [-0.5, 0.5] (instead of [0, 1]) which suits C&W attack and generally gives better performance
-    
-    :param dataset:
-    :return: 
+    Load datasets (MNIST, CIFAR-10, or SVHN) normalized to [-0.5, 0.5].
+
+    :param dataset: 'mnist', 'cifar', or 'svhn'
+    :return: train_loader, test_loader
     """
     assert dataset in ['mnist', 'cifar', 'svhn'], \
-        "dataset parameter must be either 'mnist' 'cifar' or 'svhn'"
+        "Dataset must be 'mnist', 'cifar', or 'svhn'"
+
     if dataset == 'mnist':
-        # the data, shuffled and split between train and test sets
-        (X_train, y_train), (X_test, y_test) = mnist.load_data()
-        # reshape to (n_samples, 28, 28, 1)
-        X_train = X_train.reshape(-1, 28, 28, 1)
-        X_test = X_test.reshape(-1, 28, 28, 1)
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))  # Normalize to [-0.5, 0.5]
+        ])
+        train_data = MNIST(root=DATA_PATH, train=True, download=True, transform=transform)
+        test_data = MNIST(root=DATA_PATH, train=False, download=True, transform=transform)
+
     elif dataset == 'cifar':
-        # the data, shuffled and split between train and test sets
-        (X_train, y_train), (X_test, y_test) = cifar10.load_data()
-    else:
-        if not os.path.isfile(os.path.join(PATH_DATA, "svhn_train.mat")):
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Normalize to [-0.5, 0.5]
+        ])
+        train_data = CIFAR10(root=DATA_PATH, train=True, download=True, transform=transform)
+        test_data = CIFAR10(root=DATA_PATH, train=False, download=True, transform=transform)
+
+    else:  # SVHN
+        if not os.path.isfile(os.path.join(DATA_PATH, "svhn_train.mat")):
             print('Downloading SVHN train set...')
-            call(
-                "curl -o ../data/svhn_train.mat "
-                "http://ufldl.stanford.edu/housenumbers/train_32x32.mat",
-                shell=True
-            )
-        if not os.path.isfile(os.path.join(PATH_DATA, "svhn_test.mat")):
+            os.system(f"curl -o {DATA_PATH}svhn_train.mat http://ufldl.stanford.edu/housenumbers/train_32x32.mat")
+        if not os.path.isfile(os.path.join(DATA_PATH, "svhn_test.mat")):
             print('Downloading SVHN test set...')
-            call(
-                "curl -o ../data/svhn_test.mat "
-                "http://ufldl.stanford.edu/housenumbers/test_32x32.mat",
-                shell=True
-            )
-        train = sio.loadmat(os.path.join(PATH_DATA,'svhn_train.mat'))
-        test = sio.loadmat(os.path.join(PATH_DATA, 'svhn_test.mat'))
-        X_train = np.transpose(train['X'], axes=[3, 0, 1, 2])
-        X_test = np.transpose(test['X'], axes=[3, 0, 1, 2])
-        # reshape (n_samples, 1) to (n_samples,) and change 1-index
-        # to 0-index
-        y_train = np.reshape(train['y'], (-1,)) - 1
-        y_test = np.reshape(test['y'], (-1,)) - 1
+            os.system(f"curl -o {DATA_PATH}svhn_test.mat http://ufldl.stanford.edu/housenumbers/test_32x32.mat")
 
-    # cast pixels to floats, normalize to [0, 1] range
-    X_train = X_train.astype('float32')
-    X_test = X_test.astype('float32')
-    X_train = (X_train/255.0) - (1.0 - CLIP_MAX)
-    X_test = (X_test/255.0) - (1.0 - CLIP_MAX)
+        train_data = loadmat(os.path.join(DATA_PATH, 'svhn_train.mat'))
+        test_data = loadmat(os.path.join(DATA_PATH, 'svhn_test.mat'))
 
-    # one-hot-encode the labels
-    Y_train = np_utils.to_categorical(y_train, 10)
-    Y_test = np_utils.to_categorical(y_test, 10)
+        X_train = np.transpose(train_data['X'], axes=[3, 0, 1, 2]).astype('float32') / 255.0 - (1.0 - CLIP_MAX)
+        X_test = np.transpose(test_data['X'], axes=[3, 0, 1, 2]).astype('float32') / 255.0 - (1.0 - CLIP_MAX)
+        y_train = train_data['y'].reshape(-1) - 1
+        y_test = test_data['y'].reshape(-1) - 1
 
-    print("X_train:", X_train.shape)
-    print("Y_train:", Y_train.shape)
-    print("X_test:", X_test.shape)
-    print("Y_test", Y_test.shape)
+        train_data = [(torch.tensor(X_train[i]), y_train[i]) for i in range(len(y_train))]
+        test_data = [(torch.tensor(X_test[i]), y_test[i]) for i in range(len(y_test))]
 
-    return X_train, Y_train, X_test, Y_test
+    # Create data loaders
+    train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
+
+    print("Train set size:", len(train_loader.dataset))
+    print("Test set size:", len(test_loader.dataset))
+
+    return train_loader, test_loader
 
 def get_model(dataset='mnist', softmax=True):
     """
