@@ -4,16 +4,19 @@ from __future__ import print_function
 import os
 import argparse
 import warnings
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from sklearn.neighbors import KernelDensity
-from keras.models import load_model
-
+from torchvision import datasets, transforms
+import numpy as np
 from util import (get_data, get_noisy_samples, get_mc_predictions,
-                      get_deep_representations, score_samples, normalize,
-                      get_lids_random_batch, get_kmeans_random_batch)
+                  get_deep_representations, score_samples, normalize,
+                  get_lids_random_batch, get_kmeans_random_batch)
 
 # In the original paper, the author used optimal KDE bandwidths dataset-wise
-#  that were determined from CV tuning
+# that were determined from CV tuning
 BANDWIDTHS = {'mnist': 3.7926, 'cifar': 0.26, 'svhn': 1.00}
 
 # Here we further tune bandwidth for each of the 10 classes in mnist, cifar and svhn
@@ -27,104 +30,82 @@ PATH_IMAGES = "plots/"
 
 def merge_and_generate_labels(X_pos, X_neg):
     """
-    merge positve and nagative artifact and generate labels
-    :param X_pos: positive samples
-    :param X_neg: negative samples
-    :return: X: merged samples, 2D ndarray
-             y: generated labels (0/1): 2D ndarray same size as X
+    Merge positive and negative artifacts and generate labels.
+    :param X_pos: Positive samples
+    :param X_neg: Negative samples
+    :return: X: Merged samples, 2D tensor
+             y: Generated labels (0/1), 2D tensor same size as X
     """
-    X_pos = np.asarray(X_pos, dtype=np.float32)
+    X_pos = torch.tensor(X_pos, dtype=torch.float32)
     print("X_pos: ", X_pos.shape)
-    X_pos = X_pos.reshape((X_pos.shape[0], -1))
+    X_pos = X_pos.view(X_pos.size(0), -1)
 
-    X_neg = np.asarray(X_neg, dtype=np.float32)
+    X_neg = torch.tensor(X_neg, dtype=torch.float32)
     print("X_neg: ", X_neg.shape)
-    X_neg = X_neg.reshape((X_neg.shape[0], -1))
+    X_neg = X_neg.view(X_neg.size(0), -1)
 
-    X = np.concatenate((X_pos, X_neg))
-    y = np.concatenate((np.ones(X_pos.shape[0]), np.zeros(X_neg.shape[0])))
-    y = y.reshape((X.shape[0], 1))
+    X = torch.cat((X_pos, X_neg), dim=0)
+    y = torch.cat((torch.ones(X_pos.size(0)), torch.zeros(X_neg.size(0))))
+    y = y.view(X.size(0), 1)
 
     return X, y
 
-
-def get_kd(model, X_train, Y_train, X_test, X_test_noisy, X_test_adv):
+def get_kd(model, X_train, Y_train, X_test, X_test_noisy, X_test_adv, batch_size):
     """
-    Get kernel density scores
-    :param model: 
-    :param X_train: 
-    :param Y_train: 
-    :param X_test: 
-    :param X_test_noisy: 
-    :param X_test_adv: 
-    :return: artifacts: positive and negative examples with kd values, 
-            labels: adversarial (label: 1) and normal/noisy (label: 0) examples
+    Get kernel density scores.
+    :param model: PyTorch model
+    :param X_train: Training data
+    :param Y_train: Training labels
+    :param X_test: Test data
+    :param X_test_noisy: Noisy test data
+    :param X_test_adv: Adversarial test data
+    :param batch_size: Batch size for processing
+    :return: Artifacts: Positive and negative examples with KD values
+             Labels: Adversarial (label: 1) and normal/noisy (label: 0) examples
     """
     # Get deep feature representations
     print('Getting deep feature representations...')
-    X_train_features = get_deep_representations(model, X_train,
-                                                batch_size=args.batch_size)
-    X_test_normal_features = get_deep_representations(model, X_test,
-                                                      batch_size=args.batch_size)
-    X_test_noisy_features = get_deep_representations(model, X_test_noisy,
-                                                     batch_size=args.batch_size)
-    X_test_adv_features = get_deep_representations(model, X_test_adv,
-                                                   batch_size=args.batch_size)
+    X_train_features = get_deep_representations(model, X_train, batch_size)
+    X_test_normal_features = get_deep_representations(model, X_test, batch_size)
+    X_test_noisy_features = get_deep_representations(model, X_test_noisy, batch_size)
+    X_test_adv_features = get_deep_representations(model, X_test_adv, batch_size)
+
     # Train one KDE per class
     print('Training KDEs...')
     class_inds = {}
-    for i in range(Y_train.shape[1]):
-        class_inds[i] = np.where(Y_train.argmax(axis=1) == i)[0]
+    for i in range(Y_train.size(1)):
+        class_inds[i] = torch.where(Y_train.argmax(dim=1) == i)[0]
     kdes = {}
     warnings.warn("Using pre-set kernel bandwidths that were determined "
                   "optimal for the specific CNN models of the paper. If you've "
                   "changed your model, you'll need to re-optimize the "
                   "bandwidth.")
-    print('bandwidth %.4f for %s' % (BANDWIDTHS[args.dataset], args.dataset))
-    for i in range(Y_train.shape[1]):
+    print(f'Bandwidth {BANDWIDTHS[args.dataset]:.4f} for {args.dataset}')
+    for i in range(Y_train.size(1)):
         kdes[i] = KernelDensity(kernel='gaussian',
                                 bandwidth=BANDWIDTHS[args.dataset]) \
-            .fit(X_train_features[class_inds[i]])
+            .fit(X_train_features[class_inds[i]].numpy())
+
     # Get model predictions
     print('Computing model predictions...')
-    preds_test_normal = model.predict_classes(X_test, verbose=0,
-                                              batch_size=args.batch_size)
-    preds_test_noisy = model.predict_classes(X_test_noisy, verbose=0,
-                                             batch_size=args.batch_size)
-    preds_test_adv = model.predict_classes(X_test_adv, verbose=0,
-                                           batch_size=args.batch_size)
+    preds_test_normal = torch.argmax(model(X_test), dim=1)
+    preds_test_noisy = torch.argmax(model(X_test_noisy), dim=1)
+    preds_test_adv = torch.argmax(model(X_test_adv), dim=1)
+
     # Get density estimates
-    print('computing densities...')
-    densities_normal = score_samples(
-        kdes,
-        X_test_normal_features,
-        preds_test_normal
-    )
-    densities_noisy = score_samples(
-        kdes,
-        X_test_noisy_features,
-        preds_test_noisy
-    )
-    densities_adv = score_samples(
-        kdes,
-        X_test_adv_features,
-        preds_test_adv
-    )
+    print('Computing densities...')
+    densities_normal = score_samples(kdes, X_test_normal_features, preds_test_normal.numpy())
+    densities_noisy = score_samples(kdes, X_test_noisy_features, preds_test_noisy.numpy())
+    densities_adv = score_samples(kdes, X_test_adv_features, preds_test_adv.numpy())
 
-    print("densities_normal:", densities_normal.shape)
-    print("densities_adv:", densities_adv.shape)
-    print("densities_noisy:", densities_noisy.shape)
+    print("Densities_normal:", len(densities_normal))
+    print("Densities_adv:", len(densities_adv))
+    print("Densities_noisy:", len(densities_noisy))
 
-    ## skip the normalization, you may want to try different normalizations later
-    ## so at this step, just save the raw values
-    # densities_normal_z, densities_adv_z, densities_noisy_z = normalize(
-    #     densities_normal,
-    #     densities_adv,
-    #     densities_noisy
-    # )
-
-    densities_pos = densities_adv
-    densities_neg = np.concatenate((densities_normal, densities_noisy))
+    # Skip the normalization, you may want to try different normalizations later
+    # At this step, just save the raw values
+    densities_pos = torch.tensor(densities_adv)
+    densities_neg = torch.cat((torch.tensor(densities_normal), torch.tensor(densities_noisy)))
     artifacts, labels = merge_and_generate_labels(densities_pos, densities_neg)
 
     return artifacts, labels
