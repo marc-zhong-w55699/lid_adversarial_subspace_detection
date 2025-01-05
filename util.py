@@ -5,7 +5,7 @@ import torchvision.transforms as transforms
 import numpy as np
 from torchvision.datasets import MNIST, CIFAR10
 from scipy.io import loadmat
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 
 # Constants
 STDEVS = {
@@ -26,7 +26,7 @@ def get_data(dataset='mnist'):
     Load datasets (MNIST, CIFAR-10, or SVHN) normalized to [-0.5, 0.5].
 
     :param dataset: 'mnist', 'cifar', or 'svhn'
-    :return: train_loader, test_loader
+    :return: X_train, Y_train, X_test, Y_test
     """
     assert dataset in ['mnist', 'cifar', 'svhn'], \
         "Dataset must be 'mnist', 'cifar', or 'svhn'"
@@ -38,6 +38,11 @@ def get_data(dataset='mnist'):
         ])
         train_data = MNIST(root=DATA_PATH, train=True, download=True, transform=transform)
         test_data = MNIST(root=DATA_PATH, train=False, download=True, transform=transform)
+        
+        X_train = train_data.data.unsqueeze(1).float().div(255).sub(0.5)
+        Y_train = train_data.targets.numpy()
+        X_test = test_data.data.unsqueeze(1).float().div(255).sub(0.5)
+        Y_test = test_data.targets.numpy()
 
     elif dataset == 'cifar':
         transform = transforms.Compose([
@@ -46,6 +51,11 @@ def get_data(dataset='mnist'):
         ])
         train_data = CIFAR10(root=DATA_PATH, train=True, download=True, transform=transform)
         test_data = CIFAR10(root=DATA_PATH, train=False, download=True, transform=transform)
+        
+        X_train = torch.stack([data[0] for data in train_data])
+        Y_train = np.array([data[1] for data in train_data])
+        X_test = torch.stack([data[0] for data in test_data])
+        Y_test = np.array([data[1] for data in test_data])
 
     else:  # SVHN
         if not os.path.isfile(os.path.join(DATA_PATH, "svhn_train.mat")):
@@ -60,20 +70,15 @@ def get_data(dataset='mnist'):
 
         X_train = np.transpose(train_data['X'], axes=[3, 0, 1, 2]).astype('float32') / 255.0 - (1.0 - CLIP_MAX)
         X_test = np.transpose(test_data['X'], axes=[3, 0, 1, 2]).astype('float32') / 255.0 - (1.0 - CLIP_MAX)
-        y_train = train_data['y'].reshape(-1) - 1
-        y_test = test_data['y'].reshape(-1) - 1
+        Y_train = train_data['y'].reshape(-1) - 1
+        Y_test = test_data['y'].reshape(-1) - 1
 
-        train_data = [(torch.tensor(X_train[i]), y_train[i]) for i in range(len(y_train))]
-        test_data = [(torch.tensor(X_test[i]), y_test[i]) for i in range(len(y_test))]
+    print("X_train:", X_train.shape)
+    print("Y_train:", Y_train.shape)
+    print("X_test:", X_test.shape)
+    print("Y_test", Y_test.shape)
 
-    # Create data loaders
-    train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
-    test_loader = DataLoader(test_data, batch_size=64, shuffle=False)
-
-    print("Train set size:", len(train_loader.dataset))
-    print("Test set size:", len(test_loader.dataset))
-
-    return train_loader, test_loader
+    return X_train, Y_train, X_test, Y_test
 
 def get_model(dataset='mnist', softmax=True):
     """
