@@ -7,155 +7,98 @@
 ## This program is licenced under the BSD 2-Clause licence,
 ## contained in the LICENCE file in this directory.
 
-import sys
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
-from cleverhans.utils import other_classes
-import keras.backend as K
 
-from util import lid_adv_term
-
-# settings for C&W L2 attack
-L2_BINARY_SEARCH_STEPS = 9  # number of times to adjust the constant with binary search
-L2_MAX_ITERATIONS = 1000    # number of iterations to perform gradient descent
-L2_ABORT_EARLY = True       # if we stop improving, abort gradient descent early
-L2_LEARNING_RATE = 1e-2     # larger values converge faster to less accurate results
-L2_TARGETED = True          # should we target one specific class? or just be wrong?
-L2_CONFIDENCE = 0           # how strong the adversarial example should be
-L2_INITIAL_CONST = 1e-3    # the initial constant c to pick as a first guess
+# Settings for C&W L2 attack
+L2_BINARY_SEARCH_STEPS = 9  # Number of times to adjust the constant with binary search
+L2_MAX_ITERATIONS = 1000    # Number of iterations for optimization
+L2_LEARNING_RATE = 1e-2     # Learning rate
+L2_TARGETED = True          # Whether to target a specific class
+L2_CONFIDENCE = 0           # Confidence level of adversarial examples
+L2_INITIAL_CONST = 1e-3     # Initial tradeoff constant
 
 class CarliniL2:
-    def __init__(self, sess, model, image_size, num_channels, num_labels, batch_size=100,
+    def __init__(self, model, image_size, num_channels, num_labels, batch_size=100,
                  confidence=L2_CONFIDENCE, targeted=L2_TARGETED, learning_rate=L2_LEARNING_RATE,
                  binary_search_steps=L2_BINARY_SEARCH_STEPS, max_iterations=L2_MAX_ITERATIONS,
-                 abort_early=L2_ABORT_EARLY,
-                 initial_const=L2_INITIAL_CONST):
+                 abort_early=True, initial_const=L2_INITIAL_CONST, device='cuda'):
         """
-        The L_2 optimized attack. 
-
-        This attack is the most efficient and should be used as the primary 
-        attack to evaluate potential defenses.
-
-        Returns adversarial examples for the supplied model.
-
-        confidence: Confidence of adversarial examples: higher produces examples
-          that are farther away, but more strongly classified as adversarial.
-        batch_size: Number of attacks to run simultaneously.
-        targeted: True if we should perform a targetted attack, False otherwise.
-        learning_rate: The learning rate for the attack algorithm. Smaller values
-          produce better results but are slower to converge.
-        binary_search_steps: The number of times we perform binary search to
-          find the optimal tradeoff-constant between distance and confidence. 
-        max_iterations: The maximum number of iterations. Larger values are more
-          accurate; setting too small will require a large learning rate and will
-          produce poor results.
-        abort_early: If true, allows early aborts if gradient descent gets stuck.
-        initial_const: The initial tradeoff-constant to use to tune the relative
-          importance of distance and confidence. If binary_search_steps is large,
-          the initial constant is not important.
+        The L2 optimized attack in PyTorch.
         """
         self.model = model
-        self.sess = sess
         self.image_size = image_size
         self.num_channels = num_channels
         self.num_labels = num_labels
-
-        self.TARGETED = targeted
-        self.LEARNING_RATE = learning_rate
-        self.MAX_ITERATIONS = max_iterations
-        self.BINARY_SEARCH_STEPS = binary_search_steps
-        self.ABORT_EARLY = abort_early
-        self.CONFIDENCE = confidence
-        self.initial_const = initial_const
         self.batch_size = batch_size
+        self.confidence = confidence
+        self.targeted = targeted
+        self.learning_rate = learning_rate
+        self.binary_search_steps = binary_search_steps
+        self.max_iterations = max_iterations
+        self.abort_early = abort_early
+        self.initial_const = initial_const
+        self.device = device
 
-        self.repeat = binary_search_steps >= 10
+        self.model.to(self.device)
+        self.model.eval()
 
-        shape = (self.batch_size, self.image_size, self.image_size, self.num_channels)
-
-        # the variable we're going to optimize over
-        modifier = tf.Variable(np.zeros(shape, dtype=np.float32))
-        self.max_mod = tf.reduce_max(modifier)
-
-        # these are variables to be more efficient in sending data to tf
-        self.timg = tf.Variable(np.zeros(shape), dtype=tf.float32)
-        self.tlab = tf.Variable(np.zeros((self.batch_size, self.num_labels)), dtype=tf.float32)
-        self.const = tf.Variable(np.zeros(self.batch_size), dtype=tf.float32)
-
-        # and here's what we use to assign them
-        self.assign_timg = tf.placeholder(tf.float32, shape)
-        self.assign_tlab = tf.placeholder(tf.float32, (self.batch_size, self.num_labels))
-        self.assign_const = tf.placeholder(tf.float32, [self.batch_size])
-
-        # the resulting image, tanh'd to keep bounded from -0.5 to 0.5
-        self.newimg = tf.tanh(modifier + self.timg) / 2
-
-        # prediction BEFORE-SOFTMAX of the model
-        self.output = self.model(self.newimg)
-
-        # distance to the input data
-        self.l2dist = tf.reduce_sum(tf.square(self.newimg - tf.tanh(self.timg) / 2), [1, 2, 3])
-
-        # compute the probability of the label class versus the maximum other
-        real = tf.reduce_sum((self.tlab) * self.output, 1)
-        other = tf.reduce_max((1 - self.tlab) * self.output - (self.tlab * 10000), 1)
-
-        if self.TARGETED:
-            # if targetted, optimize for making the other class most likely
-            loss1 = tf.maximum(0.0, other - real + self.CONFIDENCE)
-        else:
-            # if untargeted, optimize for making this class least likely.
-            loss1 = tf.maximum(0.0, real - other + self.CONFIDENCE)
-
-        # sum up the losses
-        self.loss2 = tf.reduce_sum(self.l2dist)
-        self.loss1 = tf.reduce_sum(self.const * loss1)
-        self.loss = self.loss1 + self.loss2
-        self.grads = tf.reduce_max(tf.gradients(self.loss, [modifier]))
-
-        # Setup the adam optimizer and keep track of variables we're creating
-        start_vars = set(x.name for x in tf.global_variables())
-        optimizer = tf.train.AdamOptimizer(self.LEARNING_RATE)
-        self.train = optimizer.minimize(self.loss, var_list=[modifier])
-        end_vars = tf.global_variables()
-        new_vars = [x for x in end_vars if x.name not in start_vars]
-
-        # these are the variables to initialize when we run
-        self.setup = []
-        self.setup.append(self.timg.assign(self.assign_timg))
-        self.setup.append(self.tlab.assign(self.assign_tlab))
-        self.setup.append(self.const.assign(self.assign_const))
-
-        self.init = tf.variables_initializer(var_list=[modifier] + new_vars)
-
-    def attack(self, X, Y):
+    def attack(self, inputs, labels):
         """
-        Perform the L_2 attack on the given images for the given targets.
-
-        :param X: samples to generate advs
-        :param Y: the original class labels
-        If self.targeted is true, then the targets represents the target labels.
-        If self.targeted is false, then targets are the original class labels.
+        Perform the attack on the input images and return adversarial examples.
         """
-        nb_classes = Y.shape[1]
+        inputs = inputs.to(self.device)
+        labels = labels.to(self.device)
 
-        # random select target class for targeted attack
-        y_target = np.copy(Y)
-        if self.TARGETED:
-            for i in range(Y.shape[0]):
-                current = int(np.argmax(Y[i]))
-                target = np.random.choice(other_classes(nb_classes, current))
-                y_target[i] = np.eye(nb_classes)[target]
+        # Initialize variables
+        modifier = torch.zeros_like(inputs, requires_grad=True, device=self.device)
+        optimizer = optim.Adam([modifier], lr=self.learning_rate)
 
-        X_adv = np.zeros_like(X)
-        for i in tqdm(range(0, X.shape[0], self.batch_size)):
-            start = i
-            end = i + self.batch_size
-            end = np.minimum(end, X.shape[0])
-            X_adv[start:end] = self.attack_batch(X[start:end], y_target[start:end])
+        best_adv = inputs.clone()
+        best_loss = torch.full((self.batch_size,), float('inf'), device=self.device)
 
-        return X_adv
+        for step in range(self.max_iterations):
+            adv_images = torch.tanh(modifier + torch.atanh(inputs * 2 - 1)) / 2
+            outputs = self.model(adv_images)
+
+            # Compute loss
+            real = torch.sum(labels * outputs, dim=1)
+            other = torch.max((1 - labels) * outputs - labels * 1e4, dim=1)[0]
+
+            if self.targeted:
+                loss1 = torch.clamp(other - real + self.confidence, min=0)
+            else:
+                loss1 = torch.clamp(real - other + self.confidence, min=0)
+
+            l2dist = torch.sum((adv_images - inputs) ** 2, dim=(1, 2, 3))
+            loss = torch.sum(self.initial_const * loss1 + l2dist)
+
+            # Update modifier
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            # Early stopping
+            if step % 10 == 0 or step == self.max_iterations - 1:
+                with torch.no_grad():
+                    preds = outputs.argmax(dim=1)
+                    if self.targeted:
+                        successful = (preds == labels.argmax(dim=1))
+                    else:
+                        successful = (preds != labels.argmax(dim=1))
+
+                    improved = successful & (l2dist < best_loss)
+                    best_adv[improved] = adv_images[improved]
+                    best_loss[improved] = l2dist[improved]
+
+                    if self.abort_early and step > self.max_iterations // 10:
+                        if not improved.any():
+                            break
+
+        return best_adv
 
     def attack_batch(self, imgs, labs):
         """
