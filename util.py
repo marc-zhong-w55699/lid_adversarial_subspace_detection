@@ -6,7 +6,8 @@ import numpy as np
 from torchvision.datasets import MNIST, CIFAR10
 from scipy.io import loadmat
 from torch.utils.data import DataLoader
-
+import torch
+import torch.nn.functional as F
 # Constants
 STDEVS = {
     'mnist': {'fgsm': 0.271, 'bim-a': 0.111, 'bim-b': 0.167, 'cw-l2': 0.207},
@@ -184,70 +185,73 @@ def get_model(dataset='mnist', softmax=True):
     return model
 
 def cross_entropy(y_true, y_pred):
-    return tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
+    """
+    y_true: Tensor of shape (batch_size, num_classes) (one-hot encoded labels)
+    y_pred: Tensor of shape (batch_size, num_classes) (raw logits)
+    """
+    # Convert one-hot labels to class indices
+    y_true_indices = torch.argmax(y_true, dim=1)
+    # Compute cross-entropy loss
+    return F.cross_entropy(y_pred, y_true_indices)
 
 def lid_term(logits, batch_size=100):
-    """Calculate LID loss term for a minibatch of logits
-
-    :param logits: 
-    :return: 
     """
-    # y_pred = tf.nn.softmax(logits)
+    Calculate LID loss term for a minibatch of logits
+
+    :param logits: Tensor of shape (batch_size, num_classes)
+    :return: LID values for the minibatch
+    """
+    # Assuming logits are already softmaxed
     y_pred = logits
 
-    # calculate pairwise distance
-    r = tf.reduce_sum(tf.square(y_pred), axis=1)
-    # turn r into column vector
-    r = tf.reshape(r, [-1, 1])
-    D = r - 2 * tf.matmul(y_pred, tf.transpose(y_pred)) + tf.transpose(r)
+    # Calculate pairwise distance
+    r = torch.sum(torch.square(y_pred), dim=1)
+    r = r.view(-1, 1)  # Turn r into column vector
+    D = r - 2 * torch.matmul(y_pred, y_pred.T) + r.T
 
-    # find the k nearest neighbor
-    D1 = tf.sqrt(D + 1e-9)
-    D2, _ = tf.nn.top_k(-D1, k=21, sorted=True)
-    D3 = -D2[:, 1:]
+    # Find the k nearest neighbors
+    D1 = torch.sqrt(D + 1e-9)  # Add epsilon for numerical stability
+    D2, _ = torch.topk(-D1, k=21, dim=1, largest=False, sorted=True)
+    D3 = -D2[:, 1:]  # Exclude the nearest neighbor (self)
 
-    m = tf.transpose(tf.multiply(tf.transpose(D3), 1.0 / D3[:, -1]))
-    v_log = tf.reduce_sum(tf.log(m + 1e-9), axis=1)  # to avoid nan
+    m = (D3.T / D3[:, -1]).T  # Normalize distances by the furthest neighbor
+    v_log = torch.sum(torch.log(m + 1e-9), dim=1)  # Avoid NaN
     lids = -20 / v_log
 
-    ## batch normalize lids
-    # lids = tf.nn.l2_normalize(lids, dim=0, epsilon=1e-12)
+    ## Batch normalize lids (optional)
+    # lids = F.normalize(lids, p=2, dim=0)
 
     return lids
 
 def lid_adv_term(clean_logits, adv_logits, batch_size=100):
-    """Calculate LID loss term for a minibatch of advs logits
-
-    :param logits: clean logits
-    :param A_logits: adversarial logits
-    :return: 
     """
-    # y_pred = tf.nn.softmax(logits)
-    c_pred = tf.reshape(clean_logits, (batch_size, -1))
-    a_pred = tf.reshape(adv_logits, (batch_size, -1))
+    Calculate LID loss term for a minibatch of adversarial logits.
 
-    # calculate pairwise distance
-    r_a = tf.reduce_sum(tf.square(a_pred), axis=1)
-    # turn r_a into column vector
-    r_a = tf.reshape(r_a, [-1, 1])
+    :param clean_logits: Tensor of clean logits (batch_size, num_features)
+    :param adv_logits: Tensor of adversarial logits (batch_size, num_features)
+    :return: LID values for the minibatch
+    """
+    # Reshape logits to ensure proper dimensions
+    c_pred = clean_logits.view(batch_size, -1)
+    a_pred = adv_logits.view(batch_size, -1)
 
-    r_c = tf.reduce_sum(tf.square(c_pred), axis=1)
-    # turn r_c into row vector
-    r_c = tf.reshape(r_c, [1, -1])
+    # Calculate pairwise distance
+    r_a = torch.sum(torch.square(a_pred), dim=1).view(-1, 1)  # Column vector
+    r_c = torch.sum(torch.square(c_pred), dim=1).view(1, -1)  # Row vector
+    D = r_a - 2 * torch.matmul(a_pred, c_pred.T) + r_c
 
-    D = r_a - 2 * tf.matmul(a_pred, tf.transpose(c_pred)) + r_c
+    # Find the k nearest neighbors
+    D1 = torch.sqrt(D + 1e-9)  # Add epsilon for numerical stability
+    D2, _ = torch.topk(-D1, k=21, dim=1, largest=False, sorted=True)  # k=21 includes self
+    D3 = -D2[:, 1:]  # Exclude the nearest neighbor (self)
 
-    # find the k nearest neighbor
-    D1 = tf.sqrt(D + 1e-9)
-    D2, _ = tf.nn.top_k(-D1, k=21, sorted=True)
-    D3 = -D2[:, 1:]
-
-    m = tf.transpose(tf.multiply(tf.transpose(D3), 1.0 / D3[:, -1]))
-    v_log = tf.reduce_sum(tf.log(m + 1e-9), axis=1)  # to avoid nan
+    # Normalize distances and calculate LID
+    m = (D3.T / D3[:, -1]).T  # Normalize distances by the furthest neighbor
+    v_log = torch.sum(torch.log(m + 1e-9), dim=1)  # Avoid NaN
     lids = -20 / v_log
 
-    ## batch normalize lids
-    lids = tf.nn.l2_normalize(lids, dim=0, epsilon=1e-12)
+    # Batch normalize lids (optional)
+    lids = F.normalize(lids, p=2, dim=0)
 
     return lids
 
