@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
-
+from util import lid_adv_term
 # Settings for C&W L2 attack
 L2_BINARY_SEARCH_STEPS = 9  # Number of times to adjust the constant with binary search
 L2_MAX_ITERATIONS = 1000    # Number of iterations for optimization
