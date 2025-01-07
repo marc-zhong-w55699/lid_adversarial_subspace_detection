@@ -100,107 +100,104 @@ class CarliniL2:
 
         return best_adv
 
-    def attack_batch(self, imgs, labs):
-        """
-        Run the attack on a batch of images and labels.
-        """
+   def attack_batch(self, imgs, labs):
+    """
+    Run the attack on a batch of images and labels.
+    """
+    def compare(x, y):
+        x = x.clone().detach()
+        x[y] -= self.confidence
+        x = x.argmax()
+        if self.targeted:
+            return x == y
+        else:
+            return x != y
 
-        def compare(x, y):
-            if not isinstance(x, (float, int, np.int64)):
-                x = np.copy(x)
-                x[y] -= self.CONFIDENCE
-                x = np.argmax(x)
-            if self.TARGETED:
-                return x == y
+    batch_size = imgs.size(0)
+
+    # Convert to tanh-space
+    imgs_tanh = torch.atanh(imgs * 1.999999).to(self.device)
+    labs = labs.to(self.device)
+
+    # Initialize bounds
+    lower_bound = torch.zeros(batch_size, device=self.device)
+    const = torch.full((batch_size,), self.initial_const, device=self.device)
+    upper_bound = torch.full((batch_size,), 1e10, device=self.device)
+
+    # Initialize best results
+    o_bestl2 = torch.full((batch_size,), 1e10, device=self.device)
+    o_bestscore = torch.full((batch_size,), -1, dtype=torch.long, device=self.device)
+    o_bestattack = imgs.clone().to(self.device)
+
+    for outer_step in range(self.binary_search_steps):
+        # Reset optimizer and modifier
+        modifier = torch.zeros_like(imgs, requires_grad=True, device=self.device)
+        optimizer = torch.optim.Adam([modifier], lr=self.learning_rate)
+
+        bestl2 = torch.full((batch_size,), 1e10, device=self.device)
+        bestscore = torch.full((batch_size,), -1, dtype=torch.long, device=self.device)
+
+        # Update constant for last binary search step
+        if self.repeat and outer_step == self.binary_search_steps - 1:
+            const = upper_bound
+
+        prev_loss = torch.full((batch_size,), 1e6, device=self.device)
+        for iteration in range(self.max_iterations):
+            # Generate adversarial examples
+            adv_images = torch.tanh(modifier + imgs_tanh) / 2
+            outputs = self.model(adv_images)
+
+            # Compute loss
+            real = torch.sum(labs * outputs, dim=1)
+            other = torch.max((1 - labs) * outputs - labs * 1e4, dim=1)[0]
+
+            if self.targeted:
+                loss1 = torch.clamp(other - real + self.confidence, min=0)
             else:
-                return x != y
+                loss1 = torch.clamp(real - other + self.confidence, min=0)
 
-        # batch_size = self.batch_size
-        batch_size = imgs.shape[0]
+            l2dist = torch.sum((adv_images - imgs) ** 2, dim=(1, 2, 3))
+            loss = torch.sum(const * loss1 + l2dist)
 
-        # convert to tanh-space
-        imgs = np.arctanh(imgs * 1.999999)
+            # Perform gradient update
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        # set the lower and upper bounds accordingly
-        lower_bound = np.zeros(batch_size)
-        CONST = np.ones(batch_size) * self.initial_const
-        upper_bound = np.ones(batch_size) * 1e10
+            # Early stopping
+            if self.abort_early and iteration % (self.max_iterations // 10) == 0:
+                if torch.all(loss > prev_loss * 0.9999):
+                    break
+                prev_loss = loss
 
-        # the best l2, score, and image attack
-        o_bestl2 = [1e10] * batch_size
-        o_bestscore = [-1] * batch_size
-        o_bestattack = [np.zeros(imgs[0].shape)] * batch_size
-        # o_bestattack = np.copy(imgs)
-
-        for outer_step in range(self.BINARY_SEARCH_STEPS):
-            # print(o_bestl2)
-            # completely reset adam's internal state.
-            self.sess.run(self.init)
-            batch = imgs[:batch_size]
-            batchlab = labs[:batch_size]
-
-            bestl2 = [1e10] * batch_size
-            bestscore = [-1] * batch_size
-
-            # The last iteration (if we run many steps) repeat the search once.
-            if self.repeat == True and outer_step == self.BINARY_SEARCH_STEPS - 1:
-                CONST = upper_bound
-
-            # set the variables so that we don't have to send them over again
-            self.sess.run(self.setup, {self.assign_timg: batch,
-                                       self.assign_tlab: batchlab,
-                                       self.assign_const: CONST})
-
-            prev = 1e6
-            for iteration in range(self.MAX_ITERATIONS):
-                # perform the attack
-                _, l, l2s, scores, nimg = self.sess.run([self.train, self.loss,
-                                                         self.l2dist, self.output,
-                                                         self.newimg], feed_dict={K.learning_phase(): 0})
-
-                # print out the losses every 10%
-                # if iteration % (self.MAX_ITERATIONS // 10) == 0:
-                #     print(iteration, self.sess.run((self.loss, self.loss1, self.loss2, self.grads, self.max_mod), feed_dict={K.learning_phase(): 0}))
-
-                # check if we should abort search if we're getting nowhere.
-                if self.ABORT_EARLY and iteration % (self.MAX_ITERATIONS // 10) == 0:
-                    if l > prev * .9999:
-                        break
-                    prev = l
-
-                # adjust the best result found so far
-                for e, (l2, sc, ii) in enumerate(zip(l2s, scores, nimg)):
-                    if l2 < bestl2[e] and compare(sc, np.argmax(batchlab[e])):
-                        bestl2[e] = l2
-                        bestscore[e] = np.argmax(sc)
-                    if l2 < o_bestl2[e] and compare(sc, np.argmax(batchlab[e])):
-                        # print('l2:', l2, 'bestl2[e]: ', bestl2[e])
-                        # print('score:', np.argmax(sc), 'bestscore[e]:', bestscore[e])
-                        # print('np.argmax(batchlab[e]):', np.argmax(batchlab[e]))
-                        o_bestl2[e] = l2
-                        o_bestscore[e] = np.argmax(sc)
-                        o_bestattack[e] = ii
-
-            # adjust the constant as needed
+            # Update best results
             for e in range(batch_size):
-                if compare(bestscore[e], np.argmax(batchlab[e])) and bestscore[e] != -1:
-                    # success, divide const by two
-                    upper_bound[e] = min(upper_bound[e], CONST[e])
-                    if upper_bound[e] < 1e9:
-                        CONST[e] = (lower_bound[e] + upper_bound[e]) / 2
-                else:
-                    # failure, either multiply by 10 if no solution found yet
-                    #          or do binary search with the known upper bound
-                    lower_bound[e] = max(lower_bound[e], CONST[e])
-                    if upper_bound[e] < 1e9:
-                        CONST[e] = (lower_bound[e] + upper_bound[e]) / 2
-                    else:
-                        CONST[e] *= 10
+                if l2dist[e] < bestl2[e] and compare(outputs[e], labs[e].argmax()):
+                    bestl2[e] = l2dist[e]
+                    bestscore[e] = outputs[e].argmax()
+                if l2dist[e] < o_bestl2[e] and compare(outputs[e], labs[e].argmax()):
+                    o_bestl2[e] = l2dist[e]
+                    o_bestscore[e] = outputs[e].argmax()
+                    o_bestattack[e] = adv_images[e]
 
-        # return the best solution found
-        o_bestl2 = np.array(o_bestl2)
-        print('sucess rate: %.4f' % (1-np.sum(o_bestl2==1e10)/self.batch_size))
-        return o_bestattack
+        # Adjust the constant for binary search
+        for e in range(batch_size):
+            if compare(bestscore[e], labs[e].argmax()) and bestscore[e] != -1:
+                upper_bound[e] = min(upper_bound[e], const[e])
+                if upper_bound[e] < 1e9:
+                    const[e] = (lower_bound[e] + upper_bound[e]) / 2
+            else:
+                lower_bound[e] = max(lower_bound[e], const[e])
+                if upper_bound[e] < 1e9:
+                    const[e] = (lower_bound[e] + upper_bound[e]) / 2
+                else:
+                    const[e] *= 10
+
+    # Compute success rate
+    success_rate = 1 - torch.sum(o_bestl2 == 1e10).item() / batch_size
+    print(f'Success rate: {success_rate:.4f}')
+    return o_bestattack
+
 
 class CarliniLID:
     def __init__(self, sess, model, image_size, num_channels, num_labels, batch_size=100,
