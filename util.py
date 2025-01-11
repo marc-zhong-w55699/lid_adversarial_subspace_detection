@@ -54,64 +54,44 @@ PATH_DATA = "data/"
 np.random.seed(0)
 
 
-def get_data(dataset='mnist'):
-    """
-    images in [-0.5, 0.5] (instead of [0, 1]) which suits C&W attack and generally gives better performance
-    
-    :param dataset:
-    :return: 
-    """
-    assert dataset in ['mnist', 'cifar', 'svhn'], \
-        "dataset parameter must be either 'mnist' 'cifar' or 'svhn'"
+def get_data(dataset, batch_size):
     if dataset == 'mnist':
-        # the data, shuffled and split between train and test sets
-        (X_train, y_train), (X_test, y_test) = mnist.load_data()
-        # reshape to (n_samples, 28, 28, 1)
-        X_train = X_train.reshape(-1, 28, 28, 1)
-        X_test = X_test.reshape(-1, 28, 28, 1)
+        transform = transforms.Compose([
+            transforms.RandomRotation(20),
+            transforms.RandomResizedCrop(28, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+        train_dataset = datasets.MNIST(root='./data', train=True, transform=transform, download=True)
+        test_dataset = datasets.MNIST(root='./data', train=False, transform=transforms.ToTensor(), download=True)
     elif dataset == 'cifar':
-        # the data, shuffled and split between train and test sets
-        (X_train, y_train), (X_test, y_test) = cifar10.load_data()
+        transform = transforms.Compose([
+            transforms.RandomRotation(20),
+            transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        train_dataset = datasets.CIFAR10(root='./data', train=True, transform=transform, download=True)
+        test_dataset = datasets.CIFAR10(root='./data', train=False, transform=transforms.ToTensor(), download=True)
+    elif dataset == 'svhn':
+        transform = transforms.Compose([
+            transforms.RandomRotation(20),
+            transforms.RandomResizedCrop(32, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+        ])
+        train_dataset = datasets.SVHN(root='./data', split='train', transform=transform, download=True)
+        test_dataset = datasets.SVHN(root='./data', split='test', transform=transforms.ToTensor(), download=True)
     else:
-        if not os.path.isfile(os.path.join(PATH_DATA, "svhn_train.mat")):
-            print('Downloading SVHN train set...')
-            call(
-                "curl -o ../data/svhn_train.mat "
-                "http://ufldl.stanford.edu/housenumbers/train_32x32.mat",
-                shell=True
-            )
-        if not os.path.isfile(os.path.join(PATH_DATA, "svhn_test.mat")):
-            print('Downloading SVHN test set...')
-            call(
-                "curl -o ../data/svhn_test.mat "
-                "http://ufldl.stanford.edu/housenumbers/test_32x32.mat",
-                shell=True
-            )
-        train = sio.loadmat(os.path.join(PATH_DATA,'svhn_train.mat'))
-        test = sio.loadmat(os.path.join(PATH_DATA, 'svhn_test.mat'))
-        X_train = np.transpose(train['X'], axes=[3, 0, 1, 2])
-        X_test = np.transpose(test['X'], axes=[3, 0, 1, 2])
-        # reshape (n_samples, 1) to (n_samples,) and change 1-index
-        # to 0-index
-        y_train = np.reshape(train['y'], (-1,)) - 1
-        y_test = np.reshape(test['y'], (-1,)) - 1
-
-    # cast pixels to floats, normalize to [0, 1] range
-    X_train = X_train.astype('float32')
-    X_test = X_test.astype('float32')
-    X_train = (X_train/255.0) - (1.0 - CLIP_MAX)
-    X_test = (X_test/255.0) - (1.0 - CLIP_MAX)
-
-    # one-hot-encode the labels
-    Y_train = np_utils.to_categorical(y_train, 10)
-    Y_test = np_utils.to_categorical(y_test, 10)
-
-    print("X_train:", X_train.shape)
-    print("Y_train:", Y_train.shape)
-    print("X_test:", X_test.shape)
-    print("Y_test", Y_test.shape)
-
-    return X_train, Y_train, X_test, Y_test
+        raise ValueError("Unsupported dataset. Choose 'mnist', 'cifar', or 'svhn'.")
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, test_loader
 
 def get_model(dataset='mnist', softmax=True):
     """
