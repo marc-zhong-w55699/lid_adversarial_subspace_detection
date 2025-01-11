@@ -237,7 +237,7 @@ def main(args):
 
     print('Loading the data and model...')
     # Load the model
-    model = load_model(model_file)
+    model = torch.load(model_file)
     # Load the dataset
     X_train, Y_train, X_test, Y_test = get_data(args.dataset)
     # Check attack type, select adversarial and noisy samples accordingly
